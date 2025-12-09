@@ -1,16 +1,16 @@
 import json
 import warnings
-from datetime import datetime, timedelta, date
+from datetime import datetime, date
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
-import matplotlib.pyplot as plt
 import streamlit as st
 
 warnings.filterwarnings("ignore")
 
-# --- YOUR LIVE SYSTEM ---
+# --- YOUR LIVE SYSTEM DEFAULTS ---
 LAT = 51.32
 LON = -0.56
 LIVE_PEAK_KW = 1.8
@@ -90,6 +90,7 @@ class EnhancedSolarEstimator:
             }
 
         except Exception:
+            # Fallback to simulated data if API fails
             return _self._generate_simulated_data(days)
 
     def _generate_simulated_data(self, days):
@@ -107,9 +108,7 @@ class EnhancedSolarEstimator:
         )
         cloud_cover = np.clip(30 + 40 * (cloud_noise + 1) / 2, 0, 100)
 
-        ghi_clear = 1000 * day_pattern * np.clip(
-            1 - 0.1 * np.sin(t / 10), 0.7, 1
-        )
+        ghi_clear = 1000 * day_pattern * np.clip(1 - 0.1 * np.sin(t / 10), 0.7, 1)
         cloud_factor = 1 - 0.8 * (cloud_cover / 100) ** 1.5
         ghi = ghi_clear * cloud_factor
 
@@ -164,16 +163,17 @@ class EnhancedSolarEstimator:
         delta_rad = np.radians(delta)
         omega_rad = np.radians(omega)
 
-        cos_theta_z = np.sin(lat_rad) * np.sin(delta_rad) + np.cos(lat_rad) * np.cos(
-            delta_rad
-        ) * np.cos(omega_rad)
+        cos_theta_z = (
+            np.sin(lat_rad) * np.sin(delta_rad)
+            + np.cos(lat_rad) * np.cos(delta_rad) * np.cos(omega_rad)
+        )
         cos_theta_z = np.clip(cos_theta_z, 0, 1)
         theta_z = np.degrees(np.arccos(cos_theta_z))
 
         sin_alpha = (
             np.cos(delta_rad)
             * np.sin(omega_rad)
-            / np.sin(np.radians(theta_z) + 1e-6)
+            / (np.sin(np.radians(theta_z)) + 1e-6)
         )
         sin_alpha = np.clip(sin_alpha, -1, 1)
         cos_alpha = (
@@ -201,9 +201,7 @@ class EnhancedSolarEstimator:
         cos_zenith = solar_pos["cos_zenith"]
         G_on = solar_pos["extraterrestrial"] / np.maximum(cos_zenith, 1e-6)
 
-        air_mass = 1 / (
-            cos_zenith + 0.50572 * (96.07995 - zenith) ** -1.6364
-        )
+        air_mass = 1 / (cos_zenith + 0.50572 * (96.07995 - zenith) ** -1.6364)
         air_mass = np.clip(air_mass, 1, 10)
         air_mass *= pressure / 1013
 
@@ -279,8 +277,8 @@ class EnhancedSolarEstimator:
         dni = weather_data["dni"]
         dhi = weather_data["dhi"]
 
-        zenith = weather_data.get("zenith", solar_pos["zenith"])
-        azimuth = weather_data.get("azimuth", solar_pos["azimuth"])
+        zenith = solar_pos["zenith"]
+        azimuth = solar_pos["azimuth"]
 
         total_poa = np.zeros_like(ghi)
 
@@ -291,10 +289,11 @@ class EnhancedSolarEstimator:
             tilt_rad = np.radians(tilt)
             zenith_rad = np.radians(zenith)
 
-            cos_aoi = np.cos(zenith_rad) * np.cos(tilt_rad) + np.sin(
-                zenith_rad
-            ) * np.sin(tilt_rad) * np.cos(
-                np.radians(azimuth - array_azimuth)
+            cos_aoi = (
+                np.cos(zenith_rad) * np.cos(tilt_rad)
+                + np.sin(zenith_rad)
+                * np.sin(tilt_rad)
+                * np.cos(np.radians(azimuth - array_azimuth))
             )
             cos_aoi = np.clip(cos_aoi, 0, 1)
 
@@ -388,7 +387,8 @@ class EnhancedSolarEstimator:
         }
 
     def calculate_expected_max(self, days=7):
-        times = pd.date_range(start=date.today(), periods=days * 24, freq="h")
+        """Clear-sky theoretical maximum over a horizon, with daily series"""
+        times = pd.date_range(start=date.today(), periods=days * 24, freq="H")
 
         ideal_weather = {
             "times": times,
@@ -406,21 +406,22 @@ class EnhancedSolarEstimator:
         ideal_weather["dni"] = clearsky["dni"]
         ideal_weather["dhi"] = clearsky["dhi"]
 
-        max_estimation = self.estimate_production(ideal_weather, method="perez")
+        # Use combined method on clear-sky GHI to get “max” production
+        max_estimation = self.estimate_production(ideal_weather, method="combined")
 
         df = pd.DataFrame(
             {"power": max_estimation["power"], "ghi": ideal_weather["ghi"]},
             index=times,
         )
 
-        daily_max = df["power"].resample("D").max() / 1000
-        daily_energy = df["power"].resample("D").sum() / 1000
+        daily_max_kw = df["power"].resample("D").max() / 1000.0
+        daily_energy_kwh = df["power"].resample("D").sum() / 1000.0
 
         return {
-            "daily_max_kw": daily_max,
-            "daily_energy_kwh": daily_energy,
-            "total_max_kw": daily_max.max(),
-            "avg_daily_energy": daily_energy.mean(),
+            "daily_max_kw": daily_max_kw,
+            "daily_energy_kwh": daily_energy_kwh,
+            "total_max_kw": daily_max_kw.max(),
+            "avg_daily_energy": daily_energy_kwh.mean(),
         }
 
 
@@ -439,7 +440,7 @@ def run_app():
         live_peak_kw = st.number_input(
             "Observed live peak (kW)", value=LIVE_PEAK_KW, format="%.2f"
         )
-        days = st.slider("Forecast days", min_value=1, max_value=7, value=3)
+        days = st.slider("Forecast days", min_value=1, max_value=31, value=7)
         method = st.selectbox(
             "Default method to highlight",
             options=["combined", "pvwatts", "perez", "cloud"],
@@ -454,30 +455,35 @@ def run_app():
         max_calc = estimator.calculate_expected_max(days=days)
 
         methods = ["pvwatts", "perez", "cloud", "combined"]
-        results = {m: estimator.estimate_production(weather_data, method=m) for m in methods}
+        results = {
+            m: estimator.estimate_production(weather_data, method=m) for m in methods
+        }
 
-    times = weather_data["times"][: 48]
+    # Use as much of the horizon as available
+    times = weather_data["times"]
     df_comparison = pd.DataFrame(index=times)
 
     for m in methods:
-        df_comparison[f"power_{m}"] = results[m]["power"][:48]
+        df_comparison[f"power_{m}"] = results[m]["power"]
 
-    df_comparison["ghi"] = weather_data["ghi"][:48]
-    df_comparison["cloud_cover"] = weather_data["cloud_cover"][:48]
-    df_comparison["temperature"] = weather_data["temperature"][:48]
+    df_comparison["ghi"] = weather_data["ghi"]
+    df_comparison["cloud_cover"] = weather_data["cloud_cover"]
+    df_comparison["temperature"] = weather_data["temperature"]
 
+    # Hourly energy (kWh)
     for m in methods:
-        df_comparison[f"energy_{m}"] = df_comparison[f"power_{m}"] / 1000
+        df_comparison[f"energy_{m}"] = df_comparison[f"power_{m}"] / 1000.0
 
+    # Summary statistics for the first full day (if available)
     summary_data = []
     for m in methods:
         peak_kw = df_comparison[f"power_{m}"].max() / 1000
-        energy_kwh = df_comparison[f"energy_{m}"][:24].sum()
+        energy_kwh_today = df_comparison[f"energy_{m}"].resample("D").sum().iloc[0]
         summary_data.append(
             {
                 "Method": m.upper(),
                 "Peak (kW)": round(peak_kw, 2),
-                "Today (kWh)": round(energy_kwh, 1),
+                "Today (kWh)": round(energy_kwh_today, 1),
                 "Diff from Max (%)": round(
                     peak_kw / max_calc["total_max_kw"] * 100, 1
                 ),
@@ -498,11 +504,49 @@ def run_app():
             "Theoretical max (kW)",
             f"{max_calc['total_max_kw']:.2f}",
         )
-
         system_efficiency = live_peak_kw / max_calc["total_max_kw"] * 100
         st.metric("Current efficiency (%)", f"{system_efficiency:.1f}")
 
-    st.markdown("### Power and energy charts")
+    # --- DAILY AND MONTHLY AVERAGES ---
+
+    # Reindex to a regular hourly index to make resampling robust
+    df_hourly = df_comparison.asfreq("H")
+
+    # Daily total energy per method
+    daily_energy = pd.DataFrame(
+        {
+            m: df_hourly[f"energy_{m}"].resample("D").sum()
+            for m in methods
+        }
+    )
+
+    # Clear-sky daily max energy from max_calc
+    max_daily_energy = max_calc["daily_energy_kwh"]
+    # Align indexes (simple nearest; fine since both are daily)
+    max_daily_energy = max_daily_energy.reindex(daily_energy.index, method="nearest")
+    daily_energy["max_clearsky_kwh"] = max_daily_energy
+
+    # Monthly average of daily totals
+    monthly_daily_avg = daily_energy.resample("M").mean()
+    monthly_daily_avg.index = monthly_daily_avg.index.to_period("M").astype(str)
+
+    st.markdown("### Monthly daily average production (kWh/day)")
+
+    monthly_view = monthly_daily_avg[
+        ["max_clearsky_kwh", "pvwatts", "combined"]
+    ].rename(
+        columns={
+            "max_clearsky_kwh": "Max clear-sky",
+            "pvwatts": "PVWatts",
+            "combined": "Combined",
+        }
+    )
+
+    st.dataframe(monthly_view.round(1), use_container_width=True)
+
+    # --- PLOTS ---
+
+    st.markdown("### Power, energy and performance charts")
 
     fig, axes = plt.subplots(3, 2, figsize=(16, 12))
     fig.suptitle(
@@ -511,6 +555,7 @@ def run_app():
         fontweight="bold",
     )
 
+    # Plot 1: Power comparison
     ax1 = axes[0, 0]
     for m in methods:
         ax1.plot(
@@ -532,6 +577,7 @@ def run_app():
     ax1.legend(loc="upper right", fontsize=9)
     ax1.grid(True, alpha=0.3)
 
+    # Plot 2: Energy accumulation
     ax2 = axes[0, 1]
     for m in methods:
         cumulative_energy = df_comparison[f"energy_{m}"].cumsum()
@@ -542,10 +588,11 @@ def run_app():
             linewidth=2,
         )
     ax2.set_ylabel("Cumulative Energy (kWh)", fontweight="bold")
-    ax2.set_title("Daily Energy Accumulation")
+    ax2.set_title("Energy Accumulation")
     ax2.legend(loc="upper left")
     ax2.grid(True, alpha=0.3)
 
+    # Plot 3: GHI and Cloud Cover
     ax3 = axes[1, 0]
     ax3.plot(df_comparison.index, df_comparison["ghi"], "orange", linewidth=2, label="GHI")
     ax3.set_ylabel("GHI (W/m²)", color="orange", fontweight="bold")
@@ -566,6 +613,7 @@ def run_app():
     ax3b.set_ylim(0, 100)
     ax3.set_title("Irradiance and Cloud Conditions")
 
+    # Plot 4: Method differences vs combined
     ax4 = axes[1, 1]
     base_power = df_comparison["power_combined"] / 1000
     for m in [mm for mm in methods if mm != "combined"]:
@@ -577,6 +625,7 @@ def run_app():
     ax4.legend(loc="upper right", fontsize=9)
     ax4.grid(True, alpha=0.3)
 
+    # Plot 5: Temperature
     ax5 = axes[2, 0]
     ax5.plot(df_comparison.index, df_comparison["temperature"], "red", linewidth=2)
     ax5.fill_between(
@@ -591,6 +640,7 @@ def run_app():
     ax5.set_title("Ambient Temperature")
     ax5.grid(True, alpha=0.3)
 
+    # Plot 6: Performance ratio vs theoretical max
     ax6 = axes[2, 1]
     for m in methods:
         performance_ratio = (
@@ -612,6 +662,8 @@ def run_app():
     plt.tight_layout()
     st.pyplot(fig)
 
+    # --- RECOMMENDATIONS & EXPORT ---
+
     avg_powers = {
         m: df_comparison[f"power_{m}"].mean() / 1000 for m in methods
     }
@@ -621,15 +673,14 @@ def run_app():
     st.write(f"Recommended method: **{recommended_method.upper()}**")
     st.write(f"Average predicted power: **{avg_powers[recommended_method]:.2f} kW**")
 
-    tomorrow_power = (
-        df_comparison["power_combined"][24:48].max() / 1000 if len(df_comparison) >= 48 else np.nan
-    )
-    tomorrow_energy = (
-        df_comparison["energy_combined"][24:48].sum() if len(df_comparison) >= 48 else np.nan
-    )
+    # Tomorrow forecast from combined method, if at least 2 days
+    daily_energy_combined = df_comparison["energy_combined"].resample("D").sum()
+    if len(daily_energy_combined) >= 2:
+        tomorrow_energy = daily_energy_combined.iloc[1]
+    else:
+        tomorrow_energy = float("nan")
 
     st.markdown("### Tomorrow's forecast (from combined method)")
-    st.write(f"Expected peak: **{tomorrow_power:.2f} kW**")
     st.write(f"Expected energy: **{tomorrow_energy:.1f} kWh**")
 
     results_summary = {
@@ -641,19 +692,16 @@ def run_app():
         "predictions": {
             m: {
                 "peak_kw": float(df_comparison[f"power_{m}"].max() / 1000),
-                "today_kwh": float(df_comparison[f"energy_{m}"][:24].sum()),
-                "tomorrow_kwh": float(df_comparison[f"energy_{m}"][24:48].sum())
-                if len(df_comparison) >= 48
-                else None,
+                "today_kwh": float(
+                    df_comparison[f"energy_{m}"].resample("D").sum().iloc[0]
+                ),
             }
             for m in methods
         },
+        "monthly_daily_avg_kwh": monthly_daily_avg.to_dict(orient="index"),
         "recommendations": {
             "best_method": recommended_method,
             "system_efficiency_percent": float(system_efficiency),
-            "improvement_potential_kw": float(
-                max_calc["total_max_kw"] - live_peak_kw
-            ),
         },
     }
 
