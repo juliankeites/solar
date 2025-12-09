@@ -440,7 +440,7 @@ def run_app():
         live_peak_kw = st.number_input(
             "Observed live peak (kW)", value=LIVE_PEAK_KW, format="%.2f"
         )
-        days = st.slider("Forecast days", min_value=1, max_value=365, value=120)
+        days = st.slider("Forecast days", min_value=1, max_value=31, value=7)
         method = st.selectbox(
             "Default method to highlight",
             options=["combined", "pvwatts", "perez", "cloud"],
@@ -459,7 +459,7 @@ def run_app():
             m: estimator.estimate_production(weather_data, method=m) for m in methods
         }
 
-    # Use full time horizon
+    # Use as much of the horizon as available
     times = weather_data["times"]
     df_comparison = pd.DataFrame(index=times)
 
@@ -474,7 +474,7 @@ def run_app():
     for m in methods:
         df_comparison[f"energy_{m}"] = df_comparison[f"power_{m}"] / 1000.0
 
-    # Summary stats for first day
+    # Summary statistics for the first full day (if available)
     summary_data = []
     for m in methods:
         peak_kw = df_comparison[f"power_{m}"].max() / 1000
@@ -509,7 +509,7 @@ def run_app():
 
     # --- DAILY AND MONTHLY AVERAGES ---
 
-    # Regular hourly index for robust resampling
+    # Reindex to a regular hourly index to make resampling robust
     df_hourly = df_comparison.asfreq("H")
 
     # Daily total energy per method
@@ -522,29 +522,30 @@ def run_app():
 
     # Clear-sky daily max energy from max_calc
     max_daily_energy = max_calc["daily_energy_kwh"]
+    # Align indexes (simple nearest; fine since both are daily)
     max_daily_energy = max_daily_energy.reindex(daily_energy.index, method="nearest")
     daily_energy["max_clearsky_kwh"] = max_daily_energy
 
-    # Monthly average of daily totals (one average "typical" day per month)
+    # Monthly average of daily totals
     monthly_daily_avg = daily_energy.resample("M").mean()
-    monthly_daily_avg.index = monthly_daily_avg.index.to_period("M")
+    monthly_daily_avg.index = monthly_daily_avg.index.to_period("M").astype(str)
 
     st.markdown("### Monthly daily average production (kWh/day)")
 
     monthly_view = monthly_daily_avg[
-        ["max_clearsky_kwh", "pvwatts", "combined", "cloud"]
+        ["max_clearsky_kwh", "pvwatts", "combined"]
     ].rename(
         columns={
             "max_clearsky_kwh": "Max clear-sky",
             "pvwatts": "PVWatts",
             "combined": "Combined",
-            "cloud": "Cloud-adjusted",
         }
     )
 
-    st.dataframe(monthly_view.round(1).rename_axis("Month").astype(float), use_container_width=True)
+    st.dataframe(monthly_view.round(1), use_container_width=True)
 
-    # --- MAIN TIME-SERIES PLOTS (unchanged from before) ---
+    # --- PLOTS ---
+
     st.markdown("### Power, energy and performance charts")
 
     fig, axes = plt.subplots(3, 2, figsize=(16, 12))
@@ -554,50 +555,114 @@ def run_app():
         fontweight="bold",
     )
 
-    # [keep your time-series plots here as before ...]
-    # ... (same as previous full app.py for ax1–ax6)
-    # After building fig:
-    # st.pyplot(fig)
+    # Plot 1: Power comparison
+    ax1 = axes[0, 0]
+    for m in methods:
+        ax1.plot(
+            df_comparison.index,
+            df_comparison[f"power_{m}"] / 1000,
+            label=m.upper(),
+            alpha=0.8,
+            linewidth=2,
+        )
+    ax1.axhline(live_peak_kw, color="red", linestyle="--", label="Your Live Peak")
+    ax1.axhline(
+        max_calc["total_max_kw"],
+        color="green",
+        linestyle=":",
+        label=f"Theoretical Max ({max_calc['total_max_kw']:.1f}kW)",
+    )
+    ax1.set_ylabel("Power (kW)", fontweight="bold")
+    ax1.set_title("Power Production - Method Comparison")
+    ax1.legend(loc="upper right", fontsize=9)
+    ax1.grid(True, alpha=0.3)
 
-    # --- SEASONAL JAN–DEC GROUPED BAR CHART ---
+    # Plot 2: Energy accumulation
+    ax2 = axes[0, 1]
+    for m in methods:
+        cumulative_energy = df_comparison[f"energy_{m}"].cumsum()
+        ax2.plot(
+            df_comparison.index,
+            cumulative_energy,
+            label=f"{m.upper()}: {cumulative_energy.iloc[-1]:.1f}kWh",
+            linewidth=2,
+        )
+    ax2.set_ylabel("Cumulative Energy (kWh)", fontweight="bold")
+    ax2.set_title("Energy Accumulation")
+    ax2.legend(loc="upper left")
+    ax2.grid(True, alpha=0.3)
 
-    st.markdown("### Seasonal monthly daily averages (Jan–Dec)")
+    # Plot 3: GHI and Cloud Cover
+    ax3 = axes[1, 0]
+    ax3.plot(df_comparison.index, df_comparison["ghi"], "orange", linewidth=2, label="GHI")
+    ax3.set_ylabel("GHI (W/m²)", color="orange", fontweight="bold")
+    ax3.tick_params(axis="y", labelcolor="orange")
+    ax3.grid(True, alpha=0.3)
 
-    # Build a clean Jan–Dec index for plotting (strings like '2025-01', etc.)
-    monthly_df = monthly_daily_avg.copy()
-    # Use month numbers 1–12 to aggregate across years, averaging where needed
-    monthly_df["month"] = monthly_df.index.month
-    month_group = monthly_df.groupby("month")[
-        ["pvwatts", "combined", "cloud"]
-    ].mean()
+    ax3b = ax3.twinx()
+    ax3b.plot(
+        df_comparison.index,
+        df_comparison["cloud_cover"],
+        "gray",
+        linewidth=1,
+        alpha=0.7,
+        label="Cloud Cover",
+    )
+    ax3b.set_ylabel("Cloud Cover (%)", color="gray", fontweight="bold")
+    ax3b.tick_params(axis="y", labelcolor="gray")
+    ax3b.set_ylim(0, 100)
+    ax3.set_title("Irradiance and Cloud Conditions")
 
-    # Ensure all 12 months are present and in order
-    all_months = range(1, 13)
-    month_group = month_group.reindex(all_months)
+    # Plot 4: Method differences vs combined
+    ax4 = axes[1, 1]
+    base_power = df_comparison["power_combined"] / 1000
+    for m in [mm for mm in methods if mm != "combined"]:
+        diff = df_comparison[f"power_{m}"] / 1000 - base_power
+        ax4.plot(df_comparison.index, diff, label=f"{m.upper()} - Combined")
+    ax4.axhline(0, color="black", linestyle="-", linewidth=0.5)
+    ax4.set_ylabel("Difference from Combined (kW)", fontweight="bold")
+    ax4.set_title("Method Differences")
+    ax4.legend(loc="upper right", fontsize=9)
+    ax4.grid(True, alpha=0.3)
 
-    month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    # Plot 5: Temperature
+    ax5 = axes[2, 0]
+    ax5.plot(df_comparison.index, df_comparison["temperature"], "red", linewidth=2)
+    ax5.fill_between(
+        df_comparison.index,
+        0,
+        df_comparison["temperature"],
+        alpha=0.2,
+        color="red",
+    )
+    ax5.set_ylabel("Temperature (°C)", fontweight="bold")
+    ax5.set_xlabel("Time")
+    ax5.set_title("Ambient Temperature")
+    ax5.grid(True, alpha=0.3)
 
-    # Create grouped bar chart
-    x = np.arange(len(all_months))
-    width = 0.25
+    # Plot 6: Performance ratio vs theoretical max
+    ax6 = axes[2, 1]
+    for m in methods:
+        performance_ratio = (
+            df_comparison[f"power_{m}"] / 1000 / max_calc["total_max_kw"] * 100
+        )
+        ax6.plot(
+            df_comparison.index,
+            performance_ratio,
+            label=m.upper(),
+            alpha=0.7,
+        )
+    ax6.set_ylabel("Performance Ratio (%)", fontweight="bold")
+    ax6.set_xlabel("Time")
+    ax6.set_title("Performance Ratio vs Theoretical Max")
+    ax6.legend(loc="upper right", fontsize=8)
+    ax6.grid(True, alpha=0.3)
+    ax6.set_ylim(0, 100)
 
-    fig2, ax = plt.subplots(figsize=(12, 4))
-    ax.bar(x - width, month_group["pvwatts"], width, label="PVWatts")
-    ax.bar(x,         month_group["combined"], width, label="Combined")
-    ax.bar(x + width, month_group["cloud"], width, label="Cloud-adjusted")
+    plt.tight_layout()
+    st.pyplot(fig)
 
-    ax.set_xticks(x)
-    ax.set_xticklabels(month_labels)
-    ax.set_ylabel("kWh per typical day")
-    ax.set_title("Seasonal monthly daily average production by method")
-    ax.legend()
-    ax.grid(axis="y", alpha=0.3)
-
-    fig2.tight_layout()
-    st.pyplot(fig2)
-
-    # --- RECOMMENDATIONS & EXPORT (as before) ---
+    # --- RECOMMENDATIONS & EXPORT ---
 
     avg_powers = {
         m: df_comparison[f"power_{m}"].mean() / 1000 for m in methods
@@ -608,6 +673,7 @@ def run_app():
     st.write(f"Recommended method: **{recommended_method.upper()}**")
     st.write(f"Average predicted power: **{avg_powers[recommended_method]:.2f} kW**")
 
+    # Tomorrow forecast from combined method, if at least 2 days
     daily_energy_combined = df_comparison["energy_combined"].resample("D").sum()
     if len(daily_energy_combined) >= 2:
         tomorrow_energy = daily_energy_combined.iloc[1]
@@ -645,6 +711,7 @@ def run_app():
         file_name="solar_analysis_results.json",
         mime="application/json",
     )
+
 
 if __name__ == "__main__":
     run_app()
