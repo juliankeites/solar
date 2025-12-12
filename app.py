@@ -1,7 +1,8 @@
 import json
 import warnings
-from datetime import datetime, date, timedelta, time
-from typing import Dict, List, Tuple
+from datetime import datetime, date, timedelta
+import time as time_module  # Avoid naming conflict
+from datetime import time as datetime_time  # Import time class from datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -26,8 +27,8 @@ MIN_SOLAR_THRESHOLD = 20  # W/m² minimum for production
 
 # Tariff defaults
 EXPORT_TARIFF_GBP_PER_KWH = 0.15  # 15p/kWh
-LOW_TARIFF_START = time(23, 30)  # 23:30
-LOW_TARIFF_END = time(5, 30)    # 05:30
+LOW_TARIFF_START = datetime_time(23, 30)  # 23:30
+LOW_TARIFF_END = datetime_time(5, 30)    # 05:30
 PEAK_FACTOR = 2.0  # Peak hours multiplier
 
 arrays = [
@@ -804,8 +805,9 @@ def run_app():
                 low_end_hour = st.number_input("Low Tariff End Hour", 0, 23, 5)
                 low_end_min = st.number_input("Low End Minute", 0, 59, 30)
             
-            low_tariff_start = time(low_start_hour, low_start_min)
-            low_tariff_end = time(low_end_hour, low_end_min)
+            # Use datetime_time (imported as datetime_time from datetime)
+            low_tariff_start = datetime_time(low_start_hour, low_start_min)
+            low_tariff_end = datetime_time(low_end_hour, low_end_min)
             
             st.info(f"Low tariff period: {low_tariff_start.strftime('%H:%M')} to {low_tariff_end.strftime('%H:%M')}")
         
