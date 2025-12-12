@@ -1,6 +1,6 @@
 import json
 import warnings
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,6 +14,14 @@ warnings.filterwarnings("ignore")
 LAT = 51.32
 LON = -0.56
 LIVE_PEAK_KW = 1.8
+
+# Battery system defaults (Tesla Powerwall 3)
+BATTERY_CAPACITY_KWH = 13.5  # Tesla Powerwall 3
+BATTERY_EFFICIENCY = 0.95
+BATTERY_MAX_CHARGE_RATE_KW = 5.0
+BATTERY_MAX_DISCHARGE_RATE_KW = 5.0
+BASELOAD_KW = 0.4
+MIN_SOLAR_THRESHOLD = 50  # W/m² minimum for production
 
 arrays = [
     {"name": "NE", "n_modules": 7, "tilt": 45, "azimuth": 30, "loss_factor": 0.85},
@@ -36,7 +44,7 @@ class EnhancedSolarEstimator:
         self.arrays = arrays
         self.total_kwp = sum(a["n_modules"] * P_MODULE_WP / 1000 for a in arrays)
 
-    @st.cache_data(show_spinner=False)
+    @st.cache_data(show_spinner=False, ttl=3600)  # Cache for 1 hour
     def get_comprehensive_weather_data(_self, days=3):
         """Get comprehensive weather data with multiple parameters"""
         url = (
@@ -46,7 +54,7 @@ class EnhancedSolarEstimator:
             f"surface_pressure,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,"
             f"direct_radiation,diffuse_radiation,global_tilted_irradiance,"
             f"direct_normal_irradiance,shortwave_radiation,precipitation,"
-            f"wind_speed_10m,wind_direction_10m"
+            f"wind_speed_10m,wind_direction_10m,is_day"
             f"&timezone=Europe%2FLondon&forecast_days={days}"
         )
 
@@ -63,6 +71,9 @@ class EnhancedSolarEstimator:
             diffuse_rad = np.array(hourly.get("diffuse_radiation", [0] * len(times)))
             dni = np.array(hourly.get("direct_normal_irradiance", [0] * len(times)))
             gti = np.array(hourly.get("global_tilted_irradiance", [0] * len(times)))
+            
+            # Day/night indicator
+            is_day = np.array(hourly.get("is_day", [1] * len(times)))
 
             # Weather parameters
             cloud_cover = np.array(hourly.get("cloud_cover", [0] * len(times)))
@@ -87,18 +98,27 @@ class EnhancedSolarEstimator:
                 "pressure": pressure,
                 "direct_rad": direct_rad,
                 "diffuse_rad": diffuse_rad,
+                "is_day": is_day,
             }
 
-        except Exception:
+        except Exception as e:
+            st.warning(f"Weather API failed: {str(e)}. Using simulated data.")
             # Fallback to simulated data if API fails
             return _self._generate_simulated_data(days)
 
     def _generate_simulated_data(self, days):
         """Generate realistic simulated data"""
         n_points = days * 24
-        times = pd.date_range(start=datetime.now(), periods=n_points, freq="H")
+        # Start from current time
+        now = datetime.now()
+        start_time = datetime(now.year, now.month, now.day, now.hour)
+        times = pd.date_range(start=start_time, periods=n_points, freq="H")
 
         t = np.linspace(0, days * 2 * np.pi, n_points)
+
+        # Generate day/night cycle based on time of day
+        hour_of_day = times.hour.values
+        is_day = (hour_of_day >= 6) & (hour_of_day <= 20)  # 6 AM to 8 PM
 
         day_pattern = np.sin(np.linspace(0, np.pi, 24)) ** 2
         day_pattern = np.tile(day_pattern, days)
@@ -111,6 +131,8 @@ class EnhancedSolarEstimator:
         ghi_clear = 1000 * day_pattern * np.clip(1 - 0.1 * np.sin(t / 10), 0.7, 1)
         cloud_factor = 1 - 0.8 * (cloud_cover / 100) ** 1.5
         ghi = ghi_clear * cloud_factor
+        # Zero out night hours
+        ghi = np.where(is_day, ghi, 0)
 
         temperature = 15 + 10 * day_pattern + 5 * np.sin(t / 10)
 
@@ -127,6 +149,7 @@ class EnhancedSolarEstimator:
             "pressure": 1013 * np.ones_like(ghi),
             "direct_rad": ghi * 0.6,
             "diffuse_rad": ghi * 0.4,
+            "is_day": is_day.astype(int),
         }
 
     def calculate_solar_position(self, times):
@@ -196,6 +219,38 @@ class EnhancedSolarEstimator:
             "extraterrestrial": G_on * cos_theta_z,
         }
 
+    def calculate_sunrise_sunset(self, times):
+        """Calculate sunrise and sunset times for each day"""
+        solar_pos = self.calculate_solar_position(times)
+        zenith = solar_pos["zenith"]
+        
+        # Find hours where sun is above horizon (zenith < 90)
+        sun_up = zenith < 90
+        
+        # Group by day
+        df = pd.DataFrame({
+            'time': times,
+            'sun_up': sun_up,
+            'zenith': zenith
+        })
+        df['date'] = df['time'].dt.date
+        
+        # Calculate sunrise/sunset for each day
+        sunrise_sunset = {}
+        for date_val, group in df.groupby('date'):
+            day_hours = group[group['sun_up']]
+            if len(day_hours) > 0:
+                sunrise = day_hours['time'].min()
+                sunset = day_hours['time'].max()
+                sunrise_sunset[date_val] = {
+                    'sunrise': sunrise,
+                    'sunset': sunset,
+                    'daylight_hours': len(day_hours),
+                    'avg_zenith': day_hours['zenith'].mean()
+                }
+        
+        return sunrise_sunset
+
     def clearsky_model_ineichen(self, solar_pos, pressure=1013):
         zenith = solar_pos["zenith"]
         cos_zenith = solar_pos["cos_zenith"]
@@ -254,6 +309,9 @@ class EnhancedSolarEstimator:
         G_ref = 1000
         gamma = -0.004
 
+        # Only generate power during daylight hours with sufficient irradiance
+        mask = (ghi > MIN_SOLAR_THRESHOLD) & (solar_pos["zenith"] < 90)
+        
         T_module = temperature + ghi * np.exp(-3.47 - 0.0594 * wind_speed) / 1000
 
         power_dc = (
@@ -262,8 +320,9 @@ class EnhancedSolarEstimator:
             * (ghi / G_ref)
             * (1 + gamma * (T_module - T_ref))
         )
+        power_dc = np.where(mask, power_dc, 0)
 
-        power_dc_per_unit = power_dc / (self.total_kwp * 1000)
+        power_dc_per_unit = power_dc / (self.total_kwp * 1000 + 1e-6)
         inv_eff = 0.96 - 0.05 * power_dc_per_unit + 0.04 * power_dc_per_unit ** 2
         inv_eff = np.clip(inv_eff, 0.9, 0.965)
 
@@ -388,7 +447,9 @@ class EnhancedSolarEstimator:
 
     def calculate_expected_max(self, days=7):
         """Clear-sky theoretical maximum over a horizon, with daily series"""
-        times = pd.date_range(start=date.today(), periods=days * 24, freq="H")
+        now = datetime.now()
+        start_time = datetime(now.year, now.month, now.day, 0, 0, 0)
+        times = pd.date_range(start=start_time, periods=days * 24, freq="H")
 
         ideal_weather = {
             "times": times,
@@ -406,7 +467,7 @@ class EnhancedSolarEstimator:
         ideal_weather["dni"] = clearsky["dni"]
         ideal_weather["dhi"] = clearsky["dhi"]
 
-        # Use combined method on clear-sky GHI to get “max” production
+        # Use combined method on clear-sky GHI to get "max" production
         max_estimation = self.estimate_production(ideal_weather, method="combined")
 
         df = pd.DataFrame(
@@ -424,6 +485,84 @@ class EnhancedSolarEstimator:
             "avg_daily_energy": daily_energy_kwh.mean(),
         }
 
+    def simulate_battery_operation(self, solar_power_kw, baseload_kw, 
+                                   battery_capacity_kwh, initial_soc_percent=50,
+                                   max_charge_rate_kw=5.0, max_discharge_rate_kw=5.0):
+        """
+        Simulate battery operation with self-consumption optimization
+        Returns: battery_soc, grid_import, grid_export, self_consumption
+        """
+        n = len(solar_power_kw)
+        battery_soc = np.zeros(n)
+        grid_import = np.zeros(n)
+        grid_export = np.zeros(n)
+        self_consumption = np.zeros(n)
+        
+        # Convert initial SOC to kWh
+        current_soc_kwh = battery_capacity_kwh * initial_soc_percent / 100
+        
+        for i in range(n):
+            # Current solar generation
+            solar_gen = solar_power_kw[i]
+            
+            # Calculate net load (positive = needs power, negative = excess)
+            net_load = baseload_kw - solar_gen
+            
+            if net_load < 0:  # Excess solar
+                excess = -net_load
+                
+                # Charge battery with excess solar
+                charge_possible = min(
+                    excess,
+                    max_charge_rate_kw,
+                    (battery_capacity_kwh - current_soc_kwh) / 1.0  # 1 hour timestep
+                )
+                charge_energy = charge_possible * BATTERY_EFFICIENCY
+                
+                current_soc_kwh += charge_energy
+                self_consumption[i] = solar_gen
+                
+                # Remaining excess goes to grid
+                grid_export[i] = excess - charge_possible
+                grid_import[i] = 0
+                
+            else:  # Solar deficit
+                deficit = net_load
+                
+                # Try to discharge battery
+                discharge_possible = min(
+                    deficit,
+                    max_discharge_rate_kw,
+                    current_soc_kwh / 1.0  # 1 hour timestep
+                )
+                
+                if discharge_possible > 0:
+                    current_soc_kwh -= discharge_possible
+                    deficit -= discharge_possible
+                    self_consumption[i] = solar_gen
+                else:
+                    self_consumption[i] = solar_gen
+                
+                # Remaining deficit comes from grid
+                grid_import[i] = deficit
+                grid_export[i] = 0
+            
+            # Ensure SOC stays within bounds
+            current_soc_kwh = np.clip(current_soc_kwh, 0, battery_capacity_kwh)
+            battery_soc[i] = current_soc_kwh
+            
+        return {
+            'battery_soc_kwh': battery_soc,
+            'battery_soc_percent': battery_soc / battery_capacity_kwh * 100,
+            'grid_import_kw': grid_import,
+            'grid_export_kw': grid_export,
+            'self_consumption_kw': self_consumption,
+            'solar_to_battery_kwh': np.sum(np.maximum(0, solar_power_kw - baseload_kw)),
+            'total_grid_import_kwh': np.sum(grid_import),
+            'total_grid_export_kwh': np.sum(grid_export),
+            'self_sufficiency_percent': np.sum(self_consumption) / (np.sum(solar_power_kw) + 1e-6) * 100
+        }
+
 
 def run_app():
     st.set_page_config(
@@ -431,16 +570,53 @@ def run_app():
         layout="wide",
     )
 
-    st.title("Enhanced Solar Production Estimation System")
+    st.title("🏠 Enhanced Solar Production with Battery Storage")
 
     with st.sidebar:
-        st.header("Configuration")
+        st.header("⚙️ Configuration")
         lat = st.number_input("Latitude", value=LAT, format="%.4f")
         lon = st.number_input("Longitude", value=LON, format="%.4f")
-        live_peak_kw = st.number_input(
-            "Observed live peak (kW)", value=LIVE_PEAK_KW, format="%.2f"
+        
+        st.subheader("🔋 Battery System")
+        battery_capacity = st.number_input(
+            "Battery capacity (kWh)", 
+            value=BATTERY_CAPACITY_KWH,
+            min_value=0.0,
+            max_value=100.0,
+            step=0.1
         )
-        days = st.slider("Forecast days", min_value=1, max_value=31, value=7)
+        initial_soc = st.slider(
+            "Initial State of Charge (%)", 
+            0, 100, 50
+        )
+        max_charge_rate = st.number_input(
+            "Max charge rate (kW)", 
+            value=BATTERY_MAX_CHARGE_RATE_KW,
+            min_value=0.0,
+            max_value=20.0,
+            step=0.1
+        )
+        max_discharge_rate = st.number_input(
+            "Max discharge rate (kW)", 
+            value=BATTERY_MAX_DISCHARGE_RATE_KW,
+            min_value=0.0,
+            max_value=20.0,
+            step=0.1
+        )
+        
+        st.subheader("🏠 House Load")
+        baseload = st.number_input(
+            "Baseload (kW)", 
+            value=BASELOAD_KW,
+            min_value=0.0,
+            max_value=10.0,
+            step=0.1
+        )
+        
+        st.subheader("📈 Forecast Settings")
+        days = st.slider("Forecast days", min_value=1, max_value=7, value=3)
+        show_night = st.checkbox("Show night hours", value=False)
+        
         method = st.selectbox(
             "Default method to highlight",
             options=["combined", "pvwatts", "perez", "cloud"],
@@ -449,7 +625,7 @@ def run_app():
 
     estimator = EnhancedSolarEstimator(lat, lon, arrays)
 
-    st.subheader("Weather data and predictions")
+    st.subheader("📊 Weather data and predictions")
     with st.spinner("Fetching weather data and running models..."):
         weather_data = estimator.get_comprehensive_weather_data(days=days)
         max_calc = estimator.calculate_expected_max(days=days)
@@ -459,6 +635,9 @@ def run_app():
             m: estimator.estimate_production(weather_data, method=m) for m in methods
         }
 
+    # Calculate sunrise/sunset times
+    sunrise_sunset = estimator.calculate_sunrise_sunset(weather_data["times"])
+    
     # Use as much of the horizon as available
     times = weather_data["times"]
     df_comparison = pd.DataFrame(index=times)
@@ -469,12 +648,42 @@ def run_app():
     df_comparison["ghi"] = weather_data["ghi"]
     df_comparison["cloud_cover"] = weather_data["cloud_cover"]
     df_comparison["temperature"] = weather_data["temperature"]
+    df_comparison["is_day"] = weather_data["is_day"]
+    
+    # Calculate solar zenith for daylight filtering
+    solar_pos = estimator.calculate_solar_position(times)
+    df_comparison["zenith"] = solar_pos["zenith"]
+    
+    # Filter for daylight hours if not showing night
+    if not show_night:
+        df_daylight = df_comparison[df_comparison["zenith"] < 90].copy()
+    else:
+        df_daylight = df_comparison.copy()
 
     # Hourly energy (kWh)
     for m in methods:
         df_comparison[f"energy_{m}"] = df_comparison[f"power_{m}"] / 1000.0
+        df_daylight[f"energy_{m}"] = df_daylight[f"power_{m}"] / 1000.0
 
-    # Summary statistics for the first full day (if available)
+    # Simulate battery operation
+    solar_power_kw = results["combined"]["power"] / 1000  # Convert to kW
+    battery_results = estimator.simulate_battery_operation(
+        solar_power_kw=solar_power_kw,
+        baseload_kw=baseload,
+        battery_capacity_kwh=battery_capacity,
+        initial_soc_percent=initial_soc,
+        max_charge_rate_kw=max_charge_rate,
+        max_discharge_rate_kw=max_discharge_rate
+    )
+    
+    # Add battery results to dataframe
+    df_comparison["battery_soc_percent"] = battery_results["battery_soc_percent"]
+    df_comparison["grid_import_kw"] = battery_results["grid_import_kw"]
+    df_comparison["grid_export_kw"] = battery_results["grid_export_kw"]
+    df_comparison["self_consumption_kw"] = battery_results["self_consumption_kw"]
+    df_comparison["net_load_kw"] = baseload - solar_power_kw
+
+    # Summary statistics
     summary_data = []
     for m in methods:
         peak_kw = df_comparison[f"power_{m}"].max() / 1000
@@ -491,170 +700,150 @@ def run_app():
         )
     summary_df = pd.DataFrame(summary_data)
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        st.markdown("### Method comparison summary")
+        st.markdown("### 📈 Method comparison")
         st.dataframe(summary_df, use_container_width=True)
 
     with col2:
-        st.markdown("### System performance")
+        st.markdown("### ⚡ System performance")
         st.metric("System capacity (kWp)", f"{TOTAL_KWP:.2f}")
-        st.metric("Observed live peak (kW)", f"{live_peak_kw:.2f}")
-        st.metric(
-            "Theoretical max (kW)",
-            f"{max_calc['total_max_kw']:.2f}",
-        )
-        system_efficiency = live_peak_kw / max_calc["total_max_kw"] * 100
+        st.metric("Theoretical max (kW)", f"{max_calc['total_max_kw']:.2f}")
+        system_efficiency = LIVE_PEAK_KW / max_calc["total_max_kw"] * 100
         st.metric("Current efficiency (%)", f"{system_efficiency:.1f}")
+        
+        # Battery metrics
+        final_soc = battery_results["battery_soc_percent"][-1]
+        st.metric("Final Battery SOC", f"{final_soc:.1f}%")
 
-    # --- DAILY AND MONTHLY AVERAGES ---
+    with col3:
+        st.markdown("### 🔋 Energy Balance")
+        st.metric("Self-sufficiency", f"{battery_results['self_sufficiency_percent']:.1f}%")
+        st.metric("Total Grid Import", f"{battery_results['total_grid_import_kwh']:.1f} kWh")
+        st.metric("Total Grid Export", f"{battery_results['total_grid_export_kwh']:.1f} kWh")
+        st.metric("Solar to Battery", f"{battery_results['solar_to_battery_kwh']:.1f} kWh")
 
-    # Reindex to a regular hourly index to make resampling robust
-    df_hourly = df_comparison.asfreq("H")
-
-    # Daily total energy per method
-    daily_energy = pd.DataFrame(
-        {
-            m: df_hourly[f"energy_{m}"].resample("D").sum()
-            for m in methods
-        }
-    )
-
-    # Clear-sky daily max energy from max_calc
-    max_daily_energy = max_calc["daily_energy_kwh"]
-    # Align indexes (simple nearest; fine since both are daily)
-    max_daily_energy = max_daily_energy.reindex(daily_energy.index, method="nearest")
-    daily_energy["max_clearsky_kwh"] = max_daily_energy
-
-    # Monthly average of daily totals
-    monthly_daily_avg = daily_energy.resample("M").mean()
-    monthly_daily_avg.index = monthly_daily_avg.index.to_period("M").astype(str)
-
-    st.markdown("### Monthly daily average production (kWh/day)")
-
-    monthly_view = monthly_daily_avg[
-        ["max_clearsky_kwh", "pvwatts", "combined"]
-    ].rename(
-        columns={
-            "max_clearsky_kwh": "Max clear-sky",
-            "pvwatts": "PVWatts",
-            "combined": "Combined",
-        }
-    )
-
-    st.dataframe(monthly_view.round(1), use_container_width=True)
+    # --- Sunrise/Sunset Information ---
+    st.markdown("### 🌅 Sunrise/Sunset Times")
+    sunrise_cols = st.columns(min(len(sunrise_sunset), 4))
+    for idx, (date_val, info) in enumerate(list(sunrise_sunset.items())[:4]):
+        with sunrise_cols[idx % 4]:
+            st.metric(
+                f"{date_val}",
+                f"{info['sunrise'].strftime('%H:%M')} - {info['sunset'].strftime('%H:%M')}",
+                f"{info['daylight_hours']}h daylight"
+            )
 
     # --- PLOTS ---
+    st.markdown("### 📊 Power, Energy and Battery Analysis")
 
-    st.markdown("### Power, energy and performance charts")
-
-    fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+    fig, axes = plt.subplots(3, 2, figsize=(16, 14))
     fig.suptitle(
-        "Enhanced Solar Production Estimation - Multi-Method Comparison",
+        f"Enhanced Solar Production with Battery Storage - {datetime.now().strftime('%d %b %Y')}",
         fontsize=16,
         fontweight="bold",
     )
 
-    # Plot 1: Power comparison
+    # Plot 1: Solar Production and Baseload
     ax1 = axes[0, 0]
     for m in methods:
         ax1.plot(
-            df_comparison.index,
-            df_comparison[f"power_{m}"] / 1000,
+            df_daylight.index,
+            df_daylight[f"power_{m}"] / 1000,
             label=m.upper(),
             alpha=0.8,
-            linewidth=2,
+            linewidth=1.5,
         )
-    ax1.axhline(live_peak_kw, color="red", linestyle="--", label="Your Live Peak")
-    ax1.axhline(
-        max_calc["total_max_kw"],
-        color="green",
-        linestyle=":",
-        label=f"Theoretical Max ({max_calc['total_max_kw']:.1f}kW)",
-    )
+    ax1.axhline(baseload, color='purple', linestyle='--', linewidth=2, label=f'Baseload ({baseload}kW)')
+    ax1.axhline(LIVE_PEAK_KW, color="red", linestyle="--", label="Your Live Peak")
+    ax1.fill_between(df_daylight.index, 0, baseload, alpha=0.1, color='purple')
     ax1.set_ylabel("Power (kW)", fontweight="bold")
-    ax1.set_title("Power Production - Method Comparison")
-    ax1.legend(loc="upper right", fontsize=9)
+    ax1.set_title("Solar Production vs Baseload")
+    ax1.legend(loc="upper right", fontsize=8)
     ax1.grid(True, alpha=0.3)
+    
+    # Shade night hours if showing them
+    if show_night:
+        night_mask = df_comparison["zenith"] >= 90
+        for night_start in df_comparison.index[night_mask]:
+            ax1.axvspan(night_start, night_start + timedelta(hours=1), 
+                       alpha=0.1, color='gray')
 
-    # Plot 2: Energy accumulation
+    # Plot 2: Battery State of Charge
     ax2 = axes[0, 1]
-    for m in methods:
-        cumulative_energy = df_comparison[f"energy_{m}"].cumsum()
-        ax2.plot(
-            df_comparison.index,
-            cumulative_energy,
-            label=f"{m.upper()}: {cumulative_energy.iloc[-1]:.1f}kWh",
-            linewidth=2,
-        )
-    ax2.set_ylabel("Cumulative Energy (kWh)", fontweight="bold")
-    ax2.set_title("Energy Accumulation")
-    ax2.legend(loc="upper left")
+    ax2.plot(df_comparison.index, df_comparison["battery_soc_percent"], 
+             color='green', linewidth=2, label='Battery SOC')
+    ax2.fill_between(df_comparison.index, 0, df_comparison["battery_soc_percent"], 
+                     alpha=0.3, color='green')
+    ax2.set_ylabel("Battery SOC (%)", fontweight="bold")
+    ax2.set_ylim(0, 100)
+    ax2.set_title("Battery State of Charge")
     ax2.grid(True, alpha=0.3)
+    ax2.legend()
 
-    # Plot 3: GHI and Cloud Cover
+    # Plot 3: Grid Import/Export
     ax3 = axes[1, 0]
-    ax3.plot(df_comparison.index, df_comparison["ghi"], "orange", linewidth=2, label="GHI")
-    ax3.set_ylabel("GHI (W/m²)", color="orange", fontweight="bold")
-    ax3.tick_params(axis="y", labelcolor="orange")
+    ax3.bar(df_comparison.index, df_comparison["grid_import_kw"], 
+            width=0.03, color='red', alpha=0.6, label='Grid Import')
+    ax3.bar(df_comparison.index, -df_comparison["grid_export_kw"], 
+            width=0.03, color='green', alpha=0.6, label='Grid Export')
+    ax3.axhline(0, color='black', linewidth=0.5)
+    ax3.set_ylabel("Grid Power (kW)", fontweight="bold")
+    ax3.set_title("Grid Import/Export")
+    ax3.legend()
     ax3.grid(True, alpha=0.3)
 
-    ax3b = ax3.twinx()
-    ax3b.plot(
-        df_comparison.index,
-        df_comparison["cloud_cover"],
-        "gray",
-        linewidth=1,
-        alpha=0.7,
-        label="Cloud Cover",
-    )
-    ax3b.set_ylabel("Cloud Cover (%)", color="gray", fontweight="bold")
-    ax3b.tick_params(axis="y", labelcolor="gray")
-    ax3b.set_ylim(0, 100)
-    ax3.set_title("Irradiance and Cloud Conditions")
-
-    # Plot 4: Method differences vs combined
+    # Plot 4: Self-Consumption Analysis
     ax4 = axes[1, 1]
-    base_power = df_comparison["power_combined"] / 1000
-    for m in [mm for mm in methods if mm != "combined"]:
-        diff = df_comparison[f"power_{m}"] / 1000 - base_power
-        ax4.plot(df_comparison.index, diff, label=f"{m.upper()} - Combined")
-    ax4.axhline(0, color="black", linestyle="-", linewidth=0.5)
-    ax4.set_ylabel("Difference from Combined (kW)", fontweight="bold")
-    ax4.set_title("Method Differences")
-    ax4.legend(loc="upper right", fontsize=9)
+    solar_kw = solar_power_kw
+    self_cons = df_comparison["self_consumption_kw"]
+    export = df_comparison["grid_export_kw"]
+    
+    ax4.stackplot(df_comparison.index, 
+                  self_cons, 
+                  export,
+                  labels=['Self-Consumed', 'Exported'],
+                  colors=['blue', 'orange'],
+                  alpha=0.7)
+    ax4.plot(df_comparison.index, solar_kw, 'k--', linewidth=1, label='Total Solar')
+    ax4.set_ylabel("Power (kW)", fontweight="bold")
+    ax4.set_title("Solar Self-Consumption Analysis")
+    ax4.legend(loc='upper right')
     ax4.grid(True, alpha=0.3)
 
-    # Plot 5: Temperature
+    # Plot 5: Net Load Profile
     ax5 = axes[2, 0]
-    ax5.plot(df_comparison.index, df_comparison["temperature"], "red", linewidth=2)
-    ax5.fill_between(
-        df_comparison.index,
-        0,
-        df_comparison["temperature"],
-        alpha=0.2,
-        color="red",
-    )
-    ax5.set_ylabel("Temperature (°C)", fontweight="bold")
+    net_load = df_comparison["net_load_kw"]
+    positive_mask = net_load >= 0
+    negative_mask = net_load < 0
+    
+    ax5.bar(df_comparison.index[positive_mask], net_load[positive_mask], 
+            width=0.03, color='red', alpha=0.6, label='Grid Needed')
+    ax5.bar(df_comparison.index[negative_mask], net_load[negative_mask], 
+            width=0.03, color='green', alpha=0.6, label='Excess Solar')
+    ax5.axhline(0, color='black', linewidth=0.5)
+    ax5.set_ylabel("Net Load (kW)", fontweight="bold")
     ax5.set_xlabel("Time")
-    ax5.set_title("Ambient Temperature")
+    ax5.set_title("Net Load Profile (Baseload - Solar)")
+    ax5.legend()
     ax5.grid(True, alpha=0.3)
 
     # Plot 6: Performance ratio vs theoretical max
     ax6 = axes[2, 1]
     for m in methods:
         performance_ratio = (
-            df_comparison[f"power_{m}"] / 1000 / max_calc["total_max_kw"] * 100
+            df_daylight[f"power_{m}"] / 1000 / max_calc["total_max_kw"] * 100
         )
         ax6.plot(
-            df_comparison.index,
+            df_daylight.index,
             performance_ratio,
             label=m.upper(),
             alpha=0.7,
+            linewidth=1.5,
         )
     ax6.set_ylabel("Performance Ratio (%)", fontweight="bold")
     ax6.set_xlabel("Time")
-    ax6.set_title("Performance Ratio vs Theoretical Max")
+    ax6.set_title("Performance Ratio vs Theoretical Max (Daylight Only)")
     ax6.legend(loc="upper right", fontsize=8)
     ax6.grid(True, alpha=0.3)
     ax6.set_ylim(0, 100)
@@ -662,32 +851,57 @@ def run_app():
     plt.tight_layout()
     st.pyplot(fig)
 
-    # --- RECOMMENDATIONS & EXPORT ---
+    # --- DAILY SUMMARY ---
+    st.markdown("### 📅 Daily Energy Summary")
+    
+    # Create daily summary
+    daily_summary = pd.DataFrame()
+    for m in methods:
+        daily_summary[f'{m}_kwh'] = df_comparison[f'energy_{m}'].resample('D').sum()
+    
+    daily_summary['grid_import_kwh'] = df_comparison['grid_import_kw'].resample('D').sum()
+    daily_summary['grid_export_kwh'] = df_comparison['grid_export_kw'].resample('D').sum()
+    daily_summary['self_consumption_kwh'] = df_comparison['self_consumption_kw'].resample('D').sum()
+    
+    # Calculate self-sufficiency for each day
+    daily_summary['self_sufficiency_%'] = (daily_summary['self_consumption_kwh'] / 
+                                          (daily_summary['combined_kwh'] + 1e-6) * 100)
+    
+    st.dataframe(daily_summary.round(1), use_container_width=True)
 
-    avg_powers = {
-        m: df_comparison[f"power_{m}"].mean() / 1000 for m in methods
-    }
-    recommended_method = max(avg_powers.items(), key=lambda x: x[1])[0]
+    # --- RECOMMENDATIONS ---
+    st.markdown("### 💡 Recommendations")
+    
+    # Find best charging times
+    excess_solar_mask = solar_power_kw > baseload
+    if excess_solar_mask.any():
+        best_charge_hours = pd.Series(solar_power_kw - baseload)[excess_solar_mask]
+        best_charge_times = best_charge_hours.nlargest(3).index
+        
+        st.write("**Best times for battery charging:**")
+        for time in best_charge_times:
+            excess = solar_power_kw[time] - baseload
+            st.write(f"- {time.strftime('%H:%M')}: {excess:.2f} kW excess solar available")
+    
+    # Grid import analysis
+    grid_import_hours = df_comparison[df_comparison['grid_import_kw'] > 0]
+    if len(grid_import_hours) > 0:
+        st.write("**Grid import occurs during:**")
+        for idx, row in grid_import_hours.head(3).iterrows():
+            st.write(f"- {idx.strftime('%H:%M')}: {row['grid_import_kw']:.2f} kW from grid")
 
-    st.markdown("### Recommendations")
-    st.write(f"Recommended method: **{recommended_method.upper()}**")
-    st.write(f"Average predicted power: **{avg_powers[recommended_method]:.2f} kW**")
-
-    # Tomorrow forecast from combined method, if at least 2 days
-    daily_energy_combined = df_comparison["energy_combined"].resample("D").sum()
-    if len(daily_energy_combined) >= 2:
-        tomorrow_energy = daily_energy_combined.iloc[1]
-    else:
-        tomorrow_energy = float("nan")
-
-    st.markdown("### Tomorrow's forecast (from combined method)")
-    st.write(f"Expected energy: **{tomorrow_energy:.1f} kWh**")
-
+    # Export results
     results_summary = {
         "system": {
             "total_kwp": TOTAL_KWP,
-            "live_peak_kw": float(live_peak_kw),
-            "theoretical_max_kw": float(max_calc["total_max_kw"]),
+            "battery_capacity_kwh": float(battery_capacity),
+            "baseload_kw": float(baseload),
+        },
+        "battery_performance": {
+            "final_soc_percent": float(battery_results["battery_soc_percent"][-1]),
+            "self_sufficiency_percent": float(battery_results["self_sufficiency_percent"]),
+            "total_grid_import_kwh": float(battery_results["total_grid_import_kwh"]),
+            "total_grid_export_kwh": float(battery_results["total_grid_export_kwh"]),
         },
         "predictions": {
             m: {
@@ -698,19 +912,25 @@ def run_app():
             }
             for m in methods
         },
-        "monthly_daily_avg_kwh": monthly_daily_avg.to_dict(orient="index"),
-        "recommendations": {
-            "best_method": recommended_method,
-            "system_efficiency_percent": float(system_efficiency),
-        },
+        "daily_summary": daily_summary.to_dict(orient="index"),
+        "sunrise_sunset": {str(k): {"sunrise": v["sunrise"].strftime("%H:%M"), 
+                                   "sunset": v["sunset"].strftime("%H:%M")} 
+                          for k, v in sunrise_sunset.items()}
     }
 
-    st.download_button(
-        "Download JSON results",
-        data=json.dumps(results_summary, indent=2),
-        file_name="solar_analysis_results.json",
-        mime="application/json",
-    )
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            "📥 Download JSON results",
+            data=json.dumps(results_summary, indent=2),
+            file_name=f"solar_battery_analysis_{datetime.now().strftime('%Y%m%d')}.json",
+            mime="application/json",
+        )
+    
+    with col2:
+        if st.button("🔄 Refresh Data"):
+            st.cache_data.clear()
+            st.rerun()
 
 
 if __name__ == "__main__":
