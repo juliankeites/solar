@@ -405,13 +405,11 @@ class EnhancedSolarEstimator:
         # Clear sky model simplified
         zenith = solar_pos["zenith"]
         day_mask = zenith < 90
-        solar_noon_mask = (zenith == zenith.min())  # Approximate solar noon
         
         # Create ideal GHI profile
         ideal_ghi = np.zeros(len(times))
         for i in range(len(times)):
             if day_mask[i]:
-                # Parabolic profile peaking at solar noon
                 hour_angle = np.abs(solar_pos["hour_angle"][i])
                 ideal_ghi[i] = 1000 * np.cos(np.radians(hour_angle * 0.75))
         
@@ -554,7 +552,6 @@ class EnhancedSolarEstimator:
         
         # Calculate optimal overnight charge target
         # Target = Expected house demand until next low tariff - Expected solar
-        # House demand = baseload * hours + peak_factor * baseload * peak_hours
         hours_until_next_night = 24  # Simplification
         expected_demand = baseload_kw * hours_until_next_night
         
@@ -785,6 +782,11 @@ def run_app():
             step=0.1
         )
         
+        # Initialize time-based control variables with defaults
+        reserve_percent = 10  # Default reserve for Time-Based Control
+        low_tariff_start = LOW_TARIFF_START
+        low_tariff_end = LOW_TARIFF_END
+        
         if powerwall_mode == "Time-Based Control":
             reserve_percent = st.slider(
                 "Reserve Level (%)",
@@ -934,9 +936,11 @@ def run_app():
     
     if powerwall_mode == "Time-Based Control":
         df_comparison["grid_charge_kw"] = battery_results["grid_charge_kw"]
+        # Create low tariff mask
+        time_of_day = pd.Series(times).dt.time
         df_comparison["low_tariff"] = (
-            (pd.Series(times).dt.time >= low_tariff_start) | 
-            (pd.Series(times).dt.time <= low_tariff_end)
+            (time_of_day >= low_tariff_start) | 
+            (time_of_day <= low_tariff_end)
         ).values
 
     # Summary statistics
