@@ -21,7 +21,7 @@ BATTERY_EFFICIENCY = 0.95
 BATTERY_MAX_CHARGE_RATE_KW = 5.0
 BATTERY_MAX_DISCHARGE_RATE_KW = 5.0
 BASELOAD_KW = 0.4
-MIN_SOLAR_THRESHOLD = 50  # W/m² minimum for production
+MIN_SOLAR_THRESHOLD = 20  # W/m² minimum for production (reduced for sensitivity)
 
 arrays = [
     {"name": "NE", "n_modules": 7, "tilt": 45, "azimuth": 30, "loss_factor": 0.85},
@@ -82,8 +82,10 @@ class EnhancedSolarEstimator:
             wind_speed = np.array(hourly.get("wind_speed_10m", [2] * len(times)))
             pressure = np.array(hourly.get("surface_pressure", [1013] * len(times)))
 
-            # Calculate GHI
+            # Calculate GHI - ensure night hours are zero
             ghi = np.maximum(0, direct_rad + diffuse_rad)
+            # Set GHI to zero for night hours
+            ghi = ghi * is_day
 
             return {
                 "times": times,
@@ -114,14 +116,26 @@ class EnhancedSolarEstimator:
         start_time = datetime(now.year, now.month, now.day, now.hour)
         times = pd.date_range(start=start_time, periods=n_points, freq="H")
 
+        # Generate day/night cycle based on solar position
+        solar_pos = self.calculate_solar_position(times)
+        zenith = solar_pos["zenith"]
+        is_day = zenith < 90  # Sun above horizon
+
         t = np.linspace(0, days * 2 * np.pi, n_points)
-
-        # Generate day/night cycle based on time of day
+        
+        # Solar pattern based on time of day
         hour_of_day = times.hour.values
-        is_day = (hour_of_day >= 6) & (hour_of_day <= 20)  # 6 AM to 8 PM
-
-        day_pattern = np.sin(np.linspace(0, np.pi, 24)) ** 2
-        day_pattern = np.tile(day_pattern, days)
+        day_pattern = np.zeros_like(hour_of_day, dtype=float)
+        for hour in range(24):
+            hour_mask = hour_of_day == hour
+            if 6 <= hour <= 18:  # Daylight hours
+                # Sinusoidal pattern peaking at solar noon (approx 12)
+                intensity = np.sin(np.pi * (hour - 6) / 12) ** 2
+                day_pattern[hour_mask] = intensity
+        
+        # Tile the pattern for multiple days
+        if days > 1:
+            day_pattern = np.tile(day_pattern[:24], days)[:n_points]
 
         cloud_noise = 0.3 * np.sin(t / 3) + 0.2 * np.sin(t / 7) + 0.1 * np.random.randn(
             n_points
@@ -131,7 +145,7 @@ class EnhancedSolarEstimator:
         ghi_clear = 1000 * day_pattern * np.clip(1 - 0.1 * np.sin(t / 10), 0.7, 1)
         cloud_factor = 1 - 0.8 * (cloud_cover / 100) ** 1.5
         ghi = ghi_clear * cloud_factor
-        # Zero out night hours
+        # Zero out night hours using solar position
         ghi = np.where(is_day, ghi, 0)
 
         temperature = 15 + 10 * day_pattern + 5 * np.sin(t / 10)
@@ -139,16 +153,16 @@ class EnhancedSolarEstimator:
         return {
             "times": times,
             "ghi": ghi,
-            "dni": ghi * 0.7,
-            "dhi": ghi * 0.3,
-            "gti": ghi * 1.1,
+            "dni": np.where(is_day, ghi * 0.7, 0),
+            "dhi": np.where(is_day, ghi * 0.3, 0),
+            "gti": np.where(is_day, ghi * 1.1, 0),
             "cloud_cover": cloud_cover,
             "temperature": temperature,
             "humidity": 60 + 20 * np.sin(t / 5),
             "wind_speed": 2 + 3 * day_pattern,
             "pressure": 1013 * np.ones_like(ghi),
-            "direct_rad": ghi * 0.6,
-            "diffuse_rad": ghi * 0.4,
+            "direct_rad": np.where(is_day, ghi * 0.6, 0),
+            "diffuse_rad": np.where(is_day, ghi * 0.4, 0),
             "is_day": is_day.astype(int),
         }
 
@@ -271,6 +285,7 @@ class EnhancedSolarEstimator:
 
         ghi_clear = dni_clear * cos_zenith + dhi_clear
 
+        # ENSURE ZERO AT NIGHT
         mask = zenith < 90
         ghi_clear = np.where(mask, ghi_clear, 0)
         dni_clear = np.where(mask, dni_clear, 0)
@@ -301,6 +316,11 @@ class EnhancedSolarEstimator:
             ghi_cloudy * (1 + 0.1 * (cloud_cover - 50) / 50),
             ghi_cloudy,
         )
+        
+        # ENSURE ZERO AT NIGHT
+        mask = zenith < 90
+        ghi_cloudy = np.where(mask, ghi_cloudy, 0)
+        transmission = np.where(mask, transmission, 0)
 
         return ghi_cloudy, transmission
 
@@ -308,10 +328,14 @@ class EnhancedSolarEstimator:
         T_ref = 25
         G_ref = 1000
         gamma = -0.004
-
-        # Only generate power during daylight hours with sufficient irradiance
-        mask = (ghi > MIN_SOLAR_THRESHOLD) & (solar_pos["zenith"] < 90)
         
+        zenith = solar_pos["zenith"]
+        
+        # ENSURE ZERO PRODUCTION AT NIGHT - sun must be above horizon
+        # Also require minimum irradiance
+        mask = (zenith < 90) & (ghi > MIN_SOLAR_THRESHOLD)
+        
+        # Calculate module temperature only for valid hours
         T_module = temperature + ghi * np.exp(-3.47 - 0.0594 * wind_speed) / 1000
 
         power_dc = (
@@ -320,14 +344,23 @@ class EnhancedSolarEstimator:
             * (ghi / G_ref)
             * (1 + gamma * (T_module - T_ref))
         )
+        # Apply mask - zero production at night or low irradiance
         power_dc = np.where(mask, power_dc, 0)
 
-        power_dc_per_unit = power_dc / (self.total_kwp * 1000 + 1e-6)
+        # Only calculate inverter efficiency for non-zero power
+        power_dc_per_unit = np.zeros_like(power_dc)
+        non_zero_mask = power_dc > 0
+        if np.any(non_zero_mask):
+            power_dc_per_unit[non_zero_mask] = power_dc[non_zero_mask] / (self.total_kwp * 1000 + 1e-6)
+        
         inv_eff = 0.96 - 0.05 * power_dc_per_unit + 0.04 * power_dc_per_unit ** 2
         inv_eff = np.clip(inv_eff, 0.9, 0.965)
 
         power_ac = power_dc * inv_eff * SYSTEM_EFFICIENCY
         power_ac = np.clip(power_ac, 0, self.total_kwp * 1000 * 1.1)
+        
+        # Final zero-check for night
+        power_ac = np.where(mask, power_ac, 0)
 
         return power_ac, T_module, inv_eff
 
@@ -366,6 +399,9 @@ class EnhancedSolarEstimator:
             poa_ground = ghi * albedo * f_ground
 
             poa_total = poa_beam + poa_diffuse + poa_ground
+            
+            # ENSURE ZERO AT NIGHT - sun must be above horizon
+            poa_total = np.where(zenith < 90, poa_total, 0)
 
             array_kwp = array["n_modules"] * P_MODULE_WP / 1000
             array_power = (
@@ -392,6 +428,10 @@ class EnhancedSolarEstimator:
 
     def estimate_production(self, weather_data, method="combined"):
         solar_pos = self.calculate_solar_position(weather_data["times"])
+        zenith = solar_pos["zenith"]
+        
+        # Day mask - only produce when sun is above horizon
+        day_mask = zenith < 90
 
         p_pvwatts, T_module, inv_eff = self.pvwatts_model(
             weather_data["ghi"],
@@ -431,18 +471,23 @@ class EnhancedSolarEstimator:
         else:
             final_power = p_pvwatts
 
+        # Apply ML correction only during daylight hours
         final_power = self.machine_learning_correction(final_power)
         final_power = np.clip(final_power, 0, self.total_kwp * 1000)
+        
+        # FINAL ENFORCEMENT: Zero production at night
+        final_power = np.where(day_mask, final_power, 0)
 
         return {
             "power": final_power,
-            "pvwatts": p_pvwatts,
-            "perez": p_perez,
-            "cloud_adj": p_cloud_adj,
+            "pvwatts": np.where(day_mask, p_pvwatts, 0),
+            "perez": np.where(day_mask, p_perez, 0),
+            "cloud_adj": np.where(day_mask, p_cloud_adj, 0),
             "temperature": T_module,
             "inverter_eff": inv_eff,
-            "cloud_transmission": cloud_trans,
+            "cloud_transmission": np.where(day_mask, cloud_trans, 0),
             "solar_zenith": solar_pos["zenith"],
+            "day_mask": day_mask,
         }
 
     def calculate_expected_max(self, days=7):
@@ -634,6 +679,17 @@ def run_app():
         results = {
             m: estimator.estimate_production(weather_data, method=m) for m in methods
         }
+        
+        # DEBUG: Show zero production verification
+        st.caption(f"Data from: {weather_data['times'][0]} to {weather_data['times'][-1]}")
+        
+        # Verify zero production at night
+        for m in methods:
+            night_hours = results[m]["solar_zenith"] >= 90
+            if np.any(night_hours):
+                night_power = results[m]["power"][night_hours]
+                if np.any(night_power > 0.1):  # Allow tiny numerical errors
+                    st.warning(f"Method {m} has non-zero production at night: max {night_power.max():.2f} W")
 
     # Calculate sunrise/sunset times
     sunrise_sunset = estimator.calculate_sunrise_sunset(weather_data["times"])
@@ -649,14 +705,12 @@ def run_app():
     df_comparison["cloud_cover"] = weather_data["cloud_cover"]
     df_comparison["temperature"] = weather_data["temperature"]
     df_comparison["is_day"] = weather_data["is_day"]
-    
-    # Calculate solar zenith for daylight filtering
-    solar_pos = estimator.calculate_solar_position(times)
-    df_comparison["zenith"] = solar_pos["zenith"]
+    df_comparison["zenith"] = results["combined"]["solar_zenith"]
+    df_comparison["day_mask"] = results["combined"]["day_mask"]
     
     # Filter for daylight hours if not showing night
     if not show_night:
-        df_daylight = df_comparison[df_comparison["zenith"] < 90].copy()
+        df_daylight = df_comparison[df_comparison["day_mask"]].copy()
     else:
         df_daylight = df_comparison.copy()
 
@@ -744,7 +798,7 @@ def run_app():
         fontweight="bold",
     )
 
-    # Plot 1: Solar Production and Baseload
+    # Plot 1: Solar Production and Baseload (Daylight only)
     ax1 = axes[0, 0]
     for m in methods:
         ax1.plot(
@@ -758,16 +812,17 @@ def run_app():
     ax1.axhline(LIVE_PEAK_KW, color="red", linestyle="--", label="Your Live Peak")
     ax1.fill_between(df_daylight.index, 0, baseload, alpha=0.1, color='purple')
     ax1.set_ylabel("Power (kW)", fontweight="bold")
-    ax1.set_title("Solar Production vs Baseload")
+    ax1.set_title("Solar Production vs Baseload (Daylight Hours)")
     ax1.legend(loc="upper right", fontsize=8)
     ax1.grid(True, alpha=0.3)
     
     # Shade night hours if showing them
     if show_night:
-        night_mask = df_comparison["zenith"] >= 90
-        for night_start in df_comparison.index[night_mask]:
+        night_mask = ~df_comparison["day_mask"]
+        night_starts = df_comparison.index[night_mask]
+        for night_start in night_starts:
             ax1.axvspan(night_start, night_start + timedelta(hours=1), 
-                       alpha=0.1, color='gray')
+                       alpha=0.1, color='gray', label='Night' if night_start == night_starts[0] else "")
 
     # Plot 2: Battery State of Charge
     ax2 = axes[0, 1]
@@ -777,66 +832,85 @@ def run_app():
                      alpha=0.3, color='green')
     ax2.set_ylabel("Battery SOC (%)", fontweight="bold")
     ax2.set_ylim(0, 100)
-    ax2.set_title("Battery State of Charge")
+    ax2.set_title("Battery State of Charge (24h)")
     ax2.grid(True, alpha=0.3)
     ax2.legend()
 
     # Plot 3: Grid Import/Export
     ax3 = axes[1, 0]
-    ax3.bar(df_comparison.index, df_comparison["grid_import_kw"], 
-            width=0.03, color='red', alpha=0.6, label='Grid Import')
-    ax3.bar(df_comparison.index, -df_comparison["grid_export_kw"], 
-            width=0.03, color='green', alpha=0.6, label='Grid Export')
+    # Only show when there's actual import/export
+    import_mask = df_comparison["grid_import_kw"] > 0
+    export_mask = df_comparison["grid_export_kw"] > 0
+    
+    if import_mask.any():
+        ax3.bar(df_comparison.index[import_mask], df_comparison["grid_import_kw"][import_mask], 
+                width=0.03, color='red', alpha=0.6, label='Grid Import')
+    if export_mask.any():
+        ax3.bar(df_comparison.index[export_mask], -df_comparison["grid_export_kw"][export_mask], 
+                width=0.03, color='green', alpha=0.6, label='Grid Export')
+    
     ax3.axhline(0, color='black', linewidth=0.5)
     ax3.set_ylabel("Grid Power (kW)", fontweight="bold")
     ax3.set_title("Grid Import/Export")
     ax3.legend()
     ax3.grid(True, alpha=0.3)
 
-    # Plot 4: Self-Consumption Analysis
+    # Plot 4: Self-Consumption Analysis (Daylight only)
     ax4 = axes[1, 1]
     solar_kw = solar_power_kw
     self_cons = df_comparison["self_consumption_kw"]
     export = df_comparison["grid_export_kw"]
     
-    ax4.stackplot(df_comparison.index, 
-                  self_cons, 
-                  export,
-                  labels=['Self-Consumed', 'Exported'],
-                  colors=['blue', 'orange'],
-                  alpha=0.7)
-    ax4.plot(df_comparison.index, solar_kw, 'k--', linewidth=1, label='Total Solar')
+    # Filter for daylight hours
+    daylight_idx = df_comparison["day_mask"]
+    if daylight_idx.any():
+        ax4.stackplot(df_comparison.index[daylight_idx], 
+                      self_cons[daylight_idx], 
+                      export[daylight_idx],
+                      labels=['Self-Consumed', 'Exported'],
+                      colors=['blue', 'orange'],
+                      alpha=0.7)
+        ax4.plot(df_comparison.index[daylight_idx], solar_kw[daylight_idx], 'k--', linewidth=1, label='Total Solar')
+    
     ax4.set_ylabel("Power (kW)", fontweight="bold")
-    ax4.set_title("Solar Self-Consumption Analysis")
+    ax4.set_title("Solar Self-Consumption Analysis (Daylight)")
     ax4.legend(loc='upper right')
     ax4.grid(True, alpha=0.3)
 
     # Plot 5: Net Load Profile
     ax5 = axes[2, 0]
     net_load = df_comparison["net_load_kw"]
-    positive_mask = net_load >= 0
-    negative_mask = net_load < 0
+    positive_mask = (net_load >= 0) & df_comparison["day_mask"]  # Only show daylight
+    negative_mask = (net_load < 0) & df_comparison["day_mask"]   # Only show daylight
     
-    ax5.bar(df_comparison.index[positive_mask], net_load[positive_mask], 
-            width=0.03, color='red', alpha=0.6, label='Grid Needed')
-    ax5.bar(df_comparison.index[negative_mask], net_load[negative_mask], 
-            width=0.03, color='green', alpha=0.6, label='Excess Solar')
+    if positive_mask.any():
+        ax5.bar(df_comparison.index[positive_mask], net_load[positive_mask], 
+                width=0.03, color='red', alpha=0.6, label='Grid Needed')
+    if negative_mask.any():
+        ax5.bar(df_comparison.index[negative_mask], net_load[negative_mask], 
+                width=0.03, color='green', alpha=0.6, label='Excess Solar')
+    
     ax5.axhline(0, color='black', linewidth=0.5)
     ax5.set_ylabel("Net Load (kW)", fontweight="bold")
     ax5.set_xlabel("Time")
-    ax5.set_title("Net Load Profile (Baseload - Solar)")
+    ax5.set_title("Net Load Profile (Baseload - Solar, Daylight)")
     ax5.legend()
     ax5.grid(True, alpha=0.3)
 
-    # Plot 6: Performance ratio vs theoretical max
+    # Plot 6: Performance ratio vs theoretical max (Daylight only)
     ax6 = axes[2, 1]
     for m in methods:
-        performance_ratio = (
-            df_daylight[f"power_{m}"] / 1000 / max_calc["total_max_kw"] * 100
-        )
+        performance_ratio = np.zeros_like(df_comparison[f"power_{m}"])
+        # Only calculate for daylight hours
+        daylight_mask = df_comparison["day_mask"]
+        if daylight_mask.any():
+            performance_ratio[daylight_mask] = (
+                df_comparison[f"power_{m}"][daylight_mask] / 1000 / max_calc["total_max_kw"] * 100
+            )
+        
         ax6.plot(
-            df_daylight.index,
-            performance_ratio,
+            df_comparison.index[daylight_mask],
+            performance_ratio[daylight_mask],
             label=m.upper(),
             alpha=0.7,
             linewidth=1.5,
@@ -869,11 +943,25 @@ def run_app():
     
     st.dataframe(daily_summary.round(1), use_container_width=True)
 
+    # --- ZERO PRODUCTION VERIFICATION ---
+    with st.expander("🔍 Production Verification"):
+        st.write("**Nighttime Production Check:**")
+        for m in methods:
+            night_mask = df_comparison["zenith"] >= 90
+            if night_mask.any():
+                night_power = df_comparison[f"power_{m}"][night_mask]
+                max_night_power = night_power.max()
+                st.write(f"{m.upper()}: Max nighttime power = {max_night_power:.2f} W (should be 0)")
+                if max_night_power > 0.1:
+                    st.error(f"❌ {m.upper()} has non-zero production at night!")
+                else:
+                    st.success(f"✅ {m.upper()} correctly shows zero production at night")
+
     # --- RECOMMENDATIONS ---
     st.markdown("### 💡 Recommendations")
     
-    # Find best charging times
-    excess_solar_mask = solar_power_kw > baseload
+    # Find best charging times (only during daylight)
+    excess_solar_mask = (solar_power_kw > baseload) & df_comparison["day_mask"]
     if excess_solar_mask.any():
         best_charge_hours = pd.Series(solar_power_kw - baseload)[excess_solar_mask]
         best_charge_times = best_charge_hours.nlargest(3).index
@@ -884,11 +972,13 @@ def run_app():
             st.write(f"- {time.strftime('%H:%M')}: {excess:.2f} kW excess solar available")
     
     # Grid import analysis
-    grid_import_hours = df_comparison[df_comparison['grid_import_kw'] > 0]
+    grid_import_hours = df_comparison[(df_comparison['grid_import_kw'] > 0) & df_comparison['day_mask']]
     if len(grid_import_hours) > 0:
-        st.write("**Grid import occurs during:**")
+        st.write("**Grid import occurs during daylight hours:**")
         for idx, row in grid_import_hours.head(3).iterrows():
             st.write(f"- {idx.strftime('%H:%M')}: {row['grid_import_kw']:.2f} kW from grid")
+    else:
+        st.write("✅ No grid import needed during daylight hours!")
 
     # Export results
     results_summary = {
